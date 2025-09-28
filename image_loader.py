@@ -7,8 +7,10 @@ import random
 import re
 
 class SequentialImageLoader:
+    counters = {}  # 使用类变量以保持状态
+
     def __init__(self):
-        self.counters = {}
+        pass
     
     @classmethod
     def INPUT_TYPES(cls):
@@ -18,9 +20,6 @@ class SequentialImageLoader:
                 "mode": (["fixed", "increment", "decrement", "random"], {"default": "increment"}),
                 "index": ("INT", {"default": 0, "min": 0, "max": 99999}),
                 "extensions": ("STRING", {"default": "png,jpg,jpeg,webp,bmp,tiff,gif", "multiline": False}),
-            },
-            "optional": {
-                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
             }
         }
     
@@ -30,8 +29,8 @@ class SequentialImageLoader:
     CATEGORY = "dialogue_extractor"
     
     @classmethod
-    def IS_CHANGED(cls, folder_path, mode, index, extensions, seed=0):
-        if mode in ["increment", "decrement"]:
+    def IS_CHANGED(cls, folder_path, mode, index, extensions):
+        if mode in ["increment", "decrement", "random"]:
             return float("NaN")
         return ""
     
@@ -62,14 +61,21 @@ class SequentialImageLoader:
         return image_files
     
     def load_image_as_tensor(self, file_path: str) -> torch.Tensor:
-        img = Image.open(file_path)
-        if img.mode != 'RGB':
-            img = img.convert('RGB')
-        img_array = np.array(img).astype(np.float32) / 255.0
-        img_tensor = torch.from_numpy(img_array)[None,]
-        return img_tensor
+        with Image.open(file_path) as img:
+            # 保持原始模式，支持 RGBA
+            if img.mode == 'RGBA':
+                img_array = np.array(img).astype(np.float32) / 255.0
+            elif img.mode != 'RGB':
+                img = img.convert('RGB')
+                img_array = np.array(img).astype(np.float32) / 255.0
+            else:
+                img_array = np.array(img).astype(np.float32) / 255.0
+
+            # 转换为 ComfyUI 标准格式 (batch, height, width, channels)
+            img_tensor = torch.from_numpy(img_array)[None,]
+            return img_tensor
     
-    def load_image(self, folder_path: str, mode: str, index: int, extensions: str, seed: int = 0):
+    def load_image(self, folder_path: str, mode: str, index: int, extensions: str):
         folder_path = folder_path.strip()
         if not folder_path:
             raise ValueError("Folder path cannot be empty")
@@ -85,21 +91,26 @@ class SequentialImageLoader:
             current_index = index % total_count
         
         elif mode == "increment":
-            if folder_path not in self.counters:
-                self.counters[folder_path] = index
+            # 初始化或获取计数器
+            if folder_path not in SequentialImageLoader.counters:
+                SequentialImageLoader.counters[folder_path] = 0
             else:
-                self.counters[folder_path] = (self.counters[folder_path] + 1) % total_count
-            current_index = self.counters[folder_path]
+                SequentialImageLoader.counters[folder_path] = (SequentialImageLoader.counters[folder_path] + 1) % total_count
+
+            # index 作为偏移量，始终影响结果
+            current_index = (index + SequentialImageLoader.counters[folder_path]) % total_count
         
         elif mode == "decrement":
-            if folder_path not in self.counters:
-                self.counters[folder_path] = index
+            # 初始化或获取计数器
+            if folder_path not in SequentialImageLoader.counters:
+                SequentialImageLoader.counters[folder_path] = 0
             else:
-                self.counters[folder_path] = (self.counters[folder_path] - 1) % total_count
-            current_index = self.counters[folder_path]
+                SequentialImageLoader.counters[folder_path] = (SequentialImageLoader.counters[folder_path] + 1) % total_count
+
+            # index 作为偏移量，decrement 模式下反向计数
+            current_index = (index - SequentialImageLoader.counters[folder_path]) % total_count
         
         elif mode == "random":
-            random.seed(seed)
             current_index = random.randint(0, total_count - 1)
         
         selected_file = image_files[current_index]
@@ -110,10 +121,60 @@ class SequentialImageLoader:
         
         return (image_tensor, filename, current_index, total_count)
 
+class ImagePathLoader:
+    """从指定路径加载单个图片"""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image_path": ("STRING", {"default": "", "multiline": False}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "STRING")
+    RETURN_NAMES = ("image", "filename")
+    FUNCTION = "load_image"
+    CATEGORY = "dialogue_extractor"
+
+    def load_image(self, image_path: str):
+        image_path = image_path.strip()
+        if not image_path:
+            raise ValueError("Image path cannot be empty")
+
+        if not os.path.exists(image_path):
+            raise ValueError(f"Image file does not exist: {image_path}")
+
+        if not os.path.isfile(image_path):
+            raise ValueError(f"Path is not a file: {image_path}")
+
+        # 提取文件名（不含扩展名）
+        filename = Path(image_path).stem
+
+        try:
+            with Image.open(image_path) as img:
+                # 保持原始模式，支持 RGBA
+                if img.mode == 'RGBA':
+                    img_array = np.array(img).astype(np.float32) / 255.0
+                elif img.mode != 'RGB':
+                    img = img.convert('RGB')
+                    img_array = np.array(img).astype(np.float32) / 255.0
+                else:
+                    img_array = np.array(img).astype(np.float32) / 255.0
+
+                # 转换为 ComfyUI 标准格式 (batch, height, width, channels)
+                img_tensor = torch.from_numpy(img_array)[None,]
+
+                return (img_tensor, filename)
+        except Exception as e:
+            raise ValueError(f"Failed to load image from {image_path}: {str(e)}")
+
 NODE_CLASS_MAPPINGS = {
     "SequentialImageLoader": SequentialImageLoader,
+    "ImagePathLoader": ImagePathLoader,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "SequentialImageLoader": "Sequential Image Loader",
+    "ImagePathLoader": "Image Path Loader",
 }
